@@ -1,11 +1,3 @@
-#!/usr/bin/env python3
-"""
-LocalChat — Chat de Voz & Texto para Redes Locais
-Funciona em LAN comum e com Tailscale (entrada manual de IP)
-
-Dependências: pip install pyaudio pillow
-"""
-
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import socket, threading, json, struct, time, base64, uuid, os, sys
@@ -14,13 +6,8 @@ from queue import Queue, Empty
 import traceback
 
 # ── Dependências opcionais ────────────────────────────────────────────────────
-try:
-    import pyaudio
-    AUDIO_OK = True
-except ImportError:
-    AUDIO_OK = False
-    print("⚠  pyaudio não encontrado — chat de voz desativado")
-    print("   Instale com: pip install pyaudio")
+import sounddevice as sd
+import numpy as np
 
 try:
     from PIL import Image, ImageTk, ImageDraw, ImageFont
@@ -30,11 +17,8 @@ except ImportError:
     print("⚠  Pillow não encontrado — avatares limitados")
     print("   Instale com: pip install pillow")
 
-try:
-    import audioop
-    AUDIOOP_OK = True
-except ImportError:
-    AUDIOOP_OK = False
+AUDIO_OK = True
+AUDIOOP_OK = True
 
 # ── Constantes de Rede ────────────────────────────────────────────────────────
 DISC_PORT  = 55100    # UDP broadcast — descoberta de salas
@@ -571,10 +555,9 @@ class RoomDiscovery:
 # ── Motor de Áudio ────────────────────────────────────────────────────────────
 
 class AudioEngine:
-    """Gerencia captura e reprodução de áudio via pyaudio."""
+    """Gerencia captura e reprodução de áudio via sounddevice (Alternativa ao PyAudio)."""
 
     def __init__(self):
-        self._pa          = None
         self._in_stream   = None
         self._out_stream  = None
         self.muted        = False
@@ -582,15 +565,14 @@ class AudioEngine:
         self._play_queue  = Queue(maxsize=30)
         self.capture_cb   = None
 
-        if AUDIO_OK:
-            try:
-                self._pa = pyaudio.PyAudio()
-            except Exception as e:
-                print(f"PyAudio init error: {e}")
-
     @property
     def available(self):
-        return AUDIO_OK and self._pa is not None
+        try:
+            import sounddevice
+            import numpy
+            return True
+        except ImportError:
+            return False
 
     def start(self, capture_cb):
         if not self.available:
@@ -599,87 +581,106 @@ class AudioEngine:
         self.running    = True
 
         try:
-            self._in_stream = self._pa.open(
-                format=pyaudio.paInt16,
+            # Configuração do Stream de Entrada (Microfone)
+            self._in_stream = sd.InputStream(
+                samplerate=A_RATE,
                 channels=A_CHANNELS,
-                rate=A_RATE,
-                input=True,
-                frames_per_buffer=A_CHUNK,
-                stream_callback=self._capture_cb,
+                dtype='int16',
+                blocksize=A_CHUNK,
+                callback=self._capture_callback
             )
-            self._in_stream.start_stream()
+            self._in_stream.start()
         except Exception as e:
-            print(f"Audio input error: {e}")
+            print(f"Erro na entrada de áudio: {e}")
 
         try:
-            self._out_stream = self._pa.open(
-                format=pyaudio.paInt16,
+            # Configuração do Stream de Saída (Alto-falantes)
+            self._out_stream = sd.OutputStream(
+                samplerate=A_RATE,
                 channels=A_CHANNELS,
-                rate=A_RATE,
-                output=True,
-                frames_per_buffer=A_CHUNK,
-                stream_callback=self._playback_cb,
+                dtype='int16',
+                blocksize=A_CHUNK,
+                callback=self._playback_callback
             )
-            self._out_stream.start_stream()
+            self._out_stream.start()
         except Exception as e:
-            print(f"Audio output error: {e}")
+            print(f"Erro na saída de áudio: {e}")
 
         return True
 
     def stop(self):
         self.running = False
-        for s in [self._in_stream, self._out_stream]:
-            if s:
-                try:
-                    s.stop_stream()
-                    s.close()
-                except:
-                    pass
+        if self._in_stream:
+            try:
+                self._in_stream.stop()
+                self._in_stream.close()
+            except: pass
+        if self._out_stream:
+            try:
+                self._out_stream.stop()
+                self._out_stream.close()
+            except: pass
         self._in_stream  = None
         self._out_stream = None
 
     def terminate(self):
         self.stop()
-        if self._pa:
-            try: self._pa.terminate()
-            except: pass
+        # sounddevice não exige terminação global como o PyAudio
 
-    def _capture_cb(self, data, frame_count, time_info, status):
+    def _capture_callback(self, indata, frames, time, status):
+        """Chamado pelo sounddevice quando novos dados do microfone chegam."""
+        if status:
+            print(f"Status de entrada: {status}")
         if not self.muted and self.capture_cb and self.running:
-            self.capture_cb(data)
-        return (None, pyaudio.paContinue)
+            # indata é um array numpy (frames, channels)
+            # convertemos para bytes para manter compatibilidade com o resto do código
+            self.capture_cb(indata.tobytes())
 
-    def _playback_cb(self, in_data, frame_count, time_info, status):
-        silence = b'\x00' * frame_count * 2
-        chunks  = []
-        # Drenar fila e misturar
+    def _playback_callback(self, outdata, frames, time, status):
+        """Chamado pelo sounddevice quando precisa de dados para tocar."""
+        if status:
+            print(f"Status de saída: {status}")
+        
+        chunks = []
+        # Coleta todos os chunks disponíveis na fila
         while True:
             try:
                 chunks.append(self._play_queue.get_nowait())
             except Empty:
                 break
+        
         if not chunks:
-            return (silence, pyaudio.paContinue)
+            outdata.fill(0)
+            return
 
-        # Misturar com audioop se disponível
-        if AUDIOOP_OK and len(chunks) > 1:
-            mixed = chunks[0]
-            for c in chunks[1:]:
-                ml = min(len(mixed), len(c))
-                try:
-                    mixed = audioop.add(mixed[:ml], c[:ml], 2)
-                except:
-                    pass
-        else:
-            mixed = chunks[-1]
+        # Mixagem usando numpy (substitui audioop.add)
+        arrays = [np.frombuffer(c, dtype=np.int16) for c in chunks]
+        
+        # Encontra o tamanho mínimo entre os chunks e o buffer solicitado
+        min_len = min(min(len(a) for a in arrays), frames * A_CHANNELS)
+        
+        # Soma os chunks em int32 para evitar overflow
+        mixed = np.zeros(min_len, dtype=np.int32)
+        for a in arrays:
+            mixed += a[:min_len]
+        
+        # Limita os valores ao range do int16 e converte
+        mixed = np.clip(mixed, -32768, 32767).astype(np.int16)
+        
+        # Preenche o buffer de saída do sounddevice
+        # outdata tem formato (frames, channels)
+        outdata[:min_len, 0] = mixed
+        if min_len < frames:
+            outdata[min_len:, 0] = 0
 
-        # Ajustar tamanho para frame_count
-        needed = frame_count * 2
-        if len(mixed) < needed:
-            mixed = mixed + silence[len(mixed):]
-        else:
-            mixed = mixed[:needed]
-        return (mixed, pyaudio.paContinue)
+    def play(self, audio_bytes):
+        try:
+            self._play_queue.put_nowait(audio_bytes)
+        except:
+            pass
+
+    def set_muted(self, muted):
+        self.muted = muted
 
     def play(self, audio_bytes):
         try:
