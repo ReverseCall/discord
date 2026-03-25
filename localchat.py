@@ -1,6 +1,6 @@
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
-import socket, threading, json, struct, time, base64, uuid, os, sys
+import socket, threading, json, struct, time, base64, uuid, os, sys, subprocess
 from io import BytesIO
 from queue import Queue, Empty
 import traceback
@@ -241,18 +241,32 @@ class ChatServer:
 
     def _discovery_loop(self):
         ip = local_ip()
+        ts_ips = get_tailscale_ips()
         while self.running:
             try:
                 with self._lock:
                     count = len(self.clients) + 1
-                payload = json.dumps({
+                
+                payload_data = {
                     'type': 'room_announce',
                     'room': self.room_name,
                     'host': ip,
                     'port': CTRL_PORT,
                     'users': count,
-                }).encode()
+                }
+
+                # 1. Broadcast padrão na rede local
+                payload = json.dumps(payload_data).encode()
                 self._disc.sendto(payload, ('<broadcast>', DISC_PORT))
+
+                # 2. Suporte para Tailscale
+                if ts_ips:
+                    for tip in ts_ips:
+                        # Atualiza o host no payload para o IP do Tailscale
+                        payload_data['host'] = tip
+                        ts_payload = json.dumps(payload_data).encode()
+                        # Enviamos para o endereço de broadcast universal que o Tailscale costuma rotear
+                        self._disc.sendto(ts_payload, ('255.255.255.255', DISC_PORT))
             except:
                 pass
             time.sleep(DISC_INTERVAL)
@@ -498,6 +512,32 @@ class ChatClient:
 
 
 # ── Descoberta de Salas ───────────────────────────────────────────────────────
+
+
+def get_tailscale_ips():
+    """Retorna uma lista de IPs da rede Tailscale (100.x.y.z)."""
+    ips = []
+    try:
+        # Tenta usar o comando 'tailscale ip'
+        output = subprocess.check_output(['tailscale', 'ip'], stderr=subprocess.STDOUT).decode()
+        for line in output.splitlines():
+            ip = line.strip()
+            if ip and not ':' in ip: # Apenas IPv4
+                ips.append(ip)
+    except:
+        try:
+            # Fallback: tenta listar todos os dispositivos se 'tailscale ip' falhar
+            output = subprocess.check_output(['tailscale', 'status', '--peers=false'], stderr=subprocess.STDOUT).decode()
+            for line in output.splitlines():
+                parts = line.split()
+                if parts:
+                    ip = parts[0]
+                    if ip.startswith('100.'):
+                        ips.append(ip)
+        except:
+            pass
+    return list(set(ips))
+
 
 class RoomDiscovery:
     """Escuta broadcasts UDP para descobrir salas na rede."""
